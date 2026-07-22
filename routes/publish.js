@@ -1,17 +1,24 @@
 // routes/publish.js
-// The new "instant response, AI works in the background" endpoint.
+// The "instant response, AI works in the background" endpoint.
 //
 // Flow:
 //   1. Teacher hits Push to Live Vault -> this route is called
-//   2. We immediately write a "processing" placeholder to Firestore and
-//      respond right away (teacher's UI unblocks here)
+//   2. We immediately create a brand NEW Firestore doc (auto-generated
+//      ID — never a fixed key) with status "processing" and respond
+//      right away (teacher's UI unblocks here)
 //   3. AFTER responding, we keep working: extract text (if PDF), call
-//      Gemini, then update that same Firestore doc with the real
-//      questions (or an error) — using the Admin SDK, so this finishes
-//      even if the teacher's tab is long closed.
+//      Gemini, then update that same new doc with the real questions
+//      (or an error) — using the Admin SDK, so this finishes even if the
+//      teacher's tab is long closed.
 //
-// Because students' past_paper.html reads the same doc, it needs to
-// check the "status" field now — see the update made there.
+// IMPORTANT: this used to compute a deterministic key
+// (`${subject}_${type}_${year}`) and .set() it, which meant a second
+// upload for the same subject/type/year silently overwrote the first
+// one. Now every upload gets its own document, so multiple quizzes,
+// or a 1st + 2nd semester exam, can all coexist. Students' past_paper.html
+// now QUERIES for matching documents (subject + type + optional semester
+// + year) instead of fetching one fixed key, and shows a picker if more
+// than one match comes back.
 
 const express = require('express');
 const multer = require('multer');
@@ -24,17 +31,19 @@ const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 
 router.post('/', upload.single('paper'), async (req, res) => {
-  const { title, grade, subject, examType, examYear, text } = req.body || {};
+  const { title, grade, subject, examType, examYear, semester, text } = req.body || {};
   const pdfFile = req.file;
 
   if (!subject || !examType || !examYear) {
     return res.status(400).json({ success: false, error: 'subject, examType, and examYear are required.' });
   }
+  if ((examType === 'Final' || examType === 'Mid') && !semester) {
+    return res.status(400).json({ success: false, error: 'semester ("1st" or "2nd") is required for Final/Mid exams.' });
+  }
   if (!text && !pdfFile) {
     return res.status(400).json({ success: false, error: 'Provide either "text" (docx, extracted client-side) or a "paper" PDF file.' });
   }
 
-  const docId = `${subject}_${examType}_${examYear}`;
   let db;
   try {
     db = getDb();
@@ -43,17 +52,21 @@ router.post('/', upload.single('paper'), async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 
+  let docRef;
   try {
-    // Step 1: write the placeholder immediately and respond right away.
-    await db.collection('past_papers').doc(docId).set({
-      key: docId,
+    // Auto-generated ID — this is what makes repeat uploads ADD instead
+    // of overwrite. .doc() with no argument reserves a fresh random ID.
+    docRef = db.collection('past_papers').doc();
+    await docRef.set({
       title: title || `${subject} ${examType} Exam`,
       grade: grade || '',
       subject,
       type: examType,
+      semester: semester || null, // only meaningful for Final/Mid
       year: examYear,
       status: 'processing',
       questions: [],
+      createdAt: new Date(),
       updatedAt: new Date(),
     });
   } catch (err) {
@@ -62,13 +75,13 @@ router.post('/', upload.single('paper'), async (req, res) => {
   }
 
   // Respond immediately — the teacher's UI unblocks here.
-  res.status(202).json({ success: true, docId, status: 'processing' });
+  res.status(202).json({ success: true, docId: docRef.id, status: 'processing' });
 
-  // Step 2: keep working AFTER the response has already been sent.
-  processInBackground({ db, docId, text, pdfFile, subject }).catch((err) => {
+  // Keep working AFTER the response has already been sent.
+  processInBackground({ db, docId: docRef.id, text, pdfFile, subject }).catch((err) => {
     // processInBackground already writes failures to Firestore; this is
     // just a final safety net so an unexpected crash doesn't go silent.
-    console.error(`Background processing crashed for ${docId}:`, err);
+    console.error(`Background processing crashed for ${docRef.id}:`, err);
   });
 });
 
