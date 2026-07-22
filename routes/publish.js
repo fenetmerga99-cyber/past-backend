@@ -84,7 +84,7 @@ async function processInBackground({ db, docId, text, pdfFile, subject }) {
     });
     console.log(`Published "${docId}" with ${questions.length} questions.`);
   } catch (err) {
-    console.error(`Solving failed for ${docId}:`, err);
+    console.error(`Solving failed for ${docId}:`, err, err.cause ? `\nCaused by: ${err.cause}` : '');
     await db.collection('past_papers').doc(docId).update({
       status: 'failed',
       error: err.message,

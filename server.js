@@ -6,6 +6,13 @@
 // raw exam text/PDF in -> solved questions out.
 
 require('dotenv').config();
+
+// Fixes a known "fetch failed" issue on some cloud hosts (Render included):
+// Node's built-in fetch sometimes resolves outbound hosts (like Google's
+// Gemini API) to an IPv6 address the container can't actually route to.
+// Forcing IPv4-first resolution avoids that entirely.
+require('node:dns').setDefaultResultOrder('ipv4first');
+
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
