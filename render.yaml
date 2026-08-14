@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ai-solver-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false          # set manually in the Render dashboard, never commit it
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash
+      - key: FIREBASE_SERVICE_ACCOUNT_BASE64
+        sync: false          # set manually in the Render dashboard, never commit it
+      # PORT is provided automatically by Render — server.js already reads process.env.PORT
