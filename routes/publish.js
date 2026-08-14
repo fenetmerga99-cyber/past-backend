@@ -31,11 +31,25 @@ const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 
 router.post('/', upload.single('paper'), async (req, res) => {
-  const { title, grade, subject, examType, examYear, semester, text } = req.body || {};
+  const { title, grade, subject, category, examYear, semester, text } = req.body || {};
+  let { examType } = req.body || {};
   const pdfFile = req.file;
 
-  if (!subject || !examType || !examYear) {
-    return res.status(400).json({ success: false, error: 'subject, examType, and examYear are required.' });
+  // National Exam is its own top-level Resource Category now (previously it
+  // was just a value buried in the exam-type dropdown). It never needs an
+  // exam-type or semester — a teacher picking "National Exam" as the
+  // category may not send `examType` at all, so we fill it in here rather
+  // than requiring the frontend to fake one.
+  const isNational = category === 'National Exam' || examType === 'National';
+  if (isNational) {
+    examType = 'National';
+  }
+
+  if (!subject || !examYear) {
+    return res.status(400).json({ success: false, error: 'subject and examYear are required.' });
+  }
+  if (!isNational && !examType) {
+    return res.status(400).json({ success: false, error: 'examType is required.' });
   }
   if ((examType === 'Final' || examType === 'Mid') && !semester) {
     return res.status(400).json({ success: false, error: 'semester ("1st" or "2nd") is required for Final/Mid exams.' });
@@ -58,10 +72,11 @@ router.post('/', upload.single('paper'), async (req, res) => {
     // of overwrite. .doc() with no argument reserves a fresh random ID.
     docRef = db.collection('past_papers').doc();
     await docRef.set({
-      title: title || `${subject} ${examType} Exam`,
+      title: title || (isNational ? `${subject} National Exam` : `${subject} ${examType} Exam`),
       grade: grade || '',
       subject,
       type: examType,
+      category: isNational ? 'National Exam' : 'Past Paper', // lets student pages / future queries filter by category directly, without inferring it from `type`
       semester: semester || null, // only meaningful for Final/Mid
       year: examYear,
       status: 'processing',
