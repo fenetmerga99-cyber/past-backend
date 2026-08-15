@@ -21,6 +21,58 @@
 
 const MAX_INPUT_CHARS = 12000;
 
+// Transient errors — worth retrying, since these are almost always
+// short-lived overload/rate-limit blips on Google's side, not a real
+// problem with the request. Anything else (bad API key, malformed
+// request, safety-filter rejection) fails the same way every time, so
+// retrying just wastes time and delays the "failed" status the teacher
+// needs to see.
+const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
+const MAX_ATTEMPTS = 3;
+const RETRY_DELAYS_MS = [1000, 3000]; // delay before attempt 2, before attempt 3
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function callGeminiOnce(url, payload) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => '');
+    const err = new Error(`Gemini API error (${response.status}): ${errBody.slice(0, 300)}`);
+    err.status = response.status;
+    throw err;
+  }
+
+  return response.json();
+}
+
+async function callGeminiWithRetry(url, payload) {
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await callGeminiOnce(url, payload);
+    } catch (err) {
+      lastErr = err;
+      const isRetryable = RETRYABLE_STATUS_CODES.has(err.status);
+      const isLastAttempt = attempt === MAX_ATTEMPTS;
+      if (!isRetryable || isLastAttempt) {
+        throw err;
+      }
+      console.warn(
+        `Gemini call failed (attempt ${attempt}/${MAX_ATTEMPTS}, status ${err.status}) — retrying in ${RETRY_DELAYS_MS[attempt - 1]}ms...`
+      );
+      await sleep(RETRY_DELAYS_MS[attempt - 1]);
+    }
+  }
+  throw lastErr;
+}
+
 function buildPrompt(subject) {
   return (
     `You are an expert ${subject || ''} teacher. You will be given the raw text of a past exam paper, ` +
@@ -88,18 +140,7 @@ async function solveExamWithGemini(text, subject) {
     },
   };
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => '');
-    throw new Error(`Gemini API error (${response.status}): ${errBody.slice(0, 300)}`);
-  }
-
-  const result = await response.json();
+  const result = await callGeminiWithRetry(url, payload);
   const candidateText = result?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!candidateText) {
     throw new Error('Gemini returned no content — the text may have been rejected by safety filters.');
@@ -156,4 +197,66 @@ async function solveExamWithGemini(text, subject) {
   return cleaned;
 }
 
-module.exports = { solveExamWithGemini };
+// ---------------------------------------------------------------------
+// Study Buddy chat — the floating support/homework-help widget.
+// Separate from solveExamWithGemini above (that one forces structured
+// JSON output for a whole exam; this one is a normal back-and-forth
+// conversation), but shares the same retry-on-503 plumbing.
+// ---------------------------------------------------------------------
+
+const CHAT_SYSTEM_PROMPT =
+  `You are "Study Buddy," a friendly AI assistant built into an Ethiopian Grade 9-12 online ` +
+  `learning platform called eLEARNING. You have two jobs:\n\n` +
+  `1. Answer educational questions clearly, at a level appropriate for a grade 9-12 student — ` +
+  `explain concepts (e.g. "what is force" in physics, math problems, biology, chemistry, history, ` +
+  `English, etc.), give worked examples, and help the student actually understand rather than just ` +
+  `handing over a final answer to copy. Keep explanations simple, clear, and encouraging.\n\n` +
+  `2. Help students navigate and troubleshoot the platform itself. The platform has 4 resource ` +
+  `categories per grade: Textbooks, Notes/Handouts, Past Papers (Final/Mid/Quiz exams), and — for ` +
+  `Grade 12 only — National Exam past papers (pick subject, then year). If a student says an exam ` +
+  `or paper isn't loading, explain that the AI step that solves it can occasionally fail if Google's ` +
+  `servers are briefly overloaded, and the fix is just to ask a teacher to re-upload it — it usually ` +
+  `works on retry.\n\n` +
+  `Keep every response short — a few sentences, or a short step-by-step list for worked problems — ` +
+  `since you're shown in a small chat widget, not a full page. Since your users are school-age ` +
+  `students, keep all responses school-appropriate and educational. If asked to write a full essay, ` +
+  `assignment, or homework answer for a student to submit as their own work, gently decline and help ` +
+  `them understand the topic well enough to write it themselves instead.`;
+
+async function chatWithGemini(history, userMessage) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY is not set on the server. Add it to your .env file.');
+  }
+
+  const model = process.env.GEMINI_CHAT_MODEL || process.env.GEMINI_MODEL || 'gemini-3.5-flash';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  // Gemini wants alternating user/model turns. Our stored history uses
+  // {role: 'user'|'assistant', content}; map 'assistant' -> 'model' and
+  // cap how far back we look so the request stays small and cheap.
+  const contents = (Array.isArray(history) ? history : [])
+    .filter((m) => m && typeof m.content === 'string' && (m.role === 'user' || m.role === 'assistant'))
+    .slice(-16)
+    .map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }));
+
+  contents.push({ role: 'user', parts: [{ text: userMessage }] });
+
+  const payload = {
+    systemInstruction: { parts: [{ text: CHAT_SYSTEM_PROMPT }] },
+    contents,
+    generationConfig: {
+      temperature: 0.7,
+      maxOutputTokens: 800,
+    },
+  };
+
+  const result = await callGeminiWithRetry(url, payload);
+  const reply = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!reply) {
+    throw new Error('Gemini returned no reply — the message may have been blocked by safety filters.');
+  }
+  return reply.trim();
+}
+
+module.exports = { solveExamWithGemini, chatWithGemini };

@@ -20,6 +20,7 @@ const multer = require('multer');
 const { solveExamWithGemini } = require('./services/gemini');
 const { extractTextFromPdf } = require('./services/pdfParser');
 const publishRoute = require('./routes/publish');
+const supportChatRoute = require('./routes/supportChat');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
@@ -62,6 +63,7 @@ app.post('/api/process-paper', upload.single('paper'), async (req, res) => {
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.use('/api/publish-exam', publishRoute);
+app.use('/api/support-chat', supportChatRoute);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
