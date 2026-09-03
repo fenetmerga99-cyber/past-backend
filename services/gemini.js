@@ -1,35 +1,26 @@
-// services/gemini.js
-// Turns raw exam text into structured, solved questions — and now
-// PRESERVES each question's real format instead of forcing everything
-// into multiple-choice.
+// Turns raw exam text into structured, solved questions.
 //
-// Every question gets a "type": one of
-//   "multiple_choice" | "true_false" | "fill_blank" | "short_answer"
-//
-// Shape per type (all share questionText + explanation):
+// Each question gets a "type": multiple_choice | true_false | fill_blank | short_answer
 //   multiple_choice -> options: [4 strings], correctOptionIndex: 0-3
 //   true_false      -> options: ["True","False"], correctOptionIndex: 0 or 1
 //   fill_blank      -> correctAnswerText: "the missing word/phrase"
-//   short_answer    -> correctAnswerText: "a model answer" (self-checked
-//                       by the student, not auto-graded — free text
-//                       answers are too varied to grade reliably by
-//                       exact string match)
+//   short_answer    -> correctAnswerText: "a model answer" (self-check only,
+//                       free text is too varied to auto-grade reliably)
 //
-// past_paper.html renders each type differently and grades multiple_choice/
-// true_false/fill_blank automatically, but shows short_answer as
-// self-check only. Don't rename these fields without updating that file.
+// Questions can also carry a "passage" — shared reading text (a comprehension
+// passage, poem, dialogue, etc.) that one or more questions depend on. When
+// several consecutive questions share the same passage text, past_paper.html
+// renders that passage once above the group instead of repeating it per question.
+//
+// past_paper.html renders each type differently, so don't rename fields
+// without updating that file too.
 
 const MAX_INPUT_CHARS = 12000;
 
-// Transient errors — worth retrying, since these are almost always
-// short-lived overload/rate-limit blips on Google's side, not a real
-// problem with the request. Anything else (bad API key, malformed
-// request, safety-filter rejection) fails the same way every time, so
-// retrying just wastes time and delays the "failed" status the teacher
-// needs to see.
+// worth retrying on these — usually just a short overload/rate-limit blip
 const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 3;
-const RETRY_DELAYS_MS = [1000, 3000]; // delay before attempt 2, before attempt 3
+const RETRY_DELAYS_MS = [1000, 3000];
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -92,7 +83,13 @@ function buildPrompt(subject) {
     `"describe..."). Give a concise model answer in correctAnswerText — this type is shown to students as a ` +
     `self-check, not auto-graded, since free-text answers vary too much to grade by exact match.\n\n` +
     `Always include a short, clear, step-by-step explanation a student could learn from, regardless of type. ` +
-    `Keep question wording faithful to the original. Return ONLY valid JSON, no markdown fences, no commentary.`
+    `Keep question wording faithful to the original.\\n\\n` +
+    `SHARED PASSAGES: some questions depend on a shared reading passage, poem, dialogue, or short text printed ` +
+    `once before a group of questions (e.g. "Read the passage below and answer questions 1-5"). When this occurs, ` +
+    `copy that shared text verbatim into the "passage" field on EVERY question that depends on it — repeat the ` +
+    `identical passage text on each one, do not summarize or shorten it. For questions that do NOT depend on a ` +
+    `shared passage, leave "passage" as an empty string. Never invent a passage that wasn't in the source text.\\n\\n` +
+    `Return ONLY valid JSON, no markdown fences, no commentary.`
   );
 }
 
@@ -126,6 +123,7 @@ async function solveExamWithGemini(text, subject) {
               properties: {
                 type: { type: 'STRING' }, // multiple_choice | true_false | fill_blank | short_answer
                 questionText: { type: 'STRING' },
+                passage: { type: 'STRING' }, // shared reading passage, repeated verbatim on every question that depends on it; empty string if none
                 options: { type: 'ARRAY', items: { type: 'STRING' } }, // multiple_choice / true_false only
                 correctOptionIndex: { type: 'INTEGER' }, // multiple_choice / true_false only
                 correctAnswerText: { type: 'STRING' }, // fill_blank / short_answer only
@@ -163,6 +161,7 @@ async function solveExamWithGemini(text, subject) {
       const base = {
         type,
         questionText: String(q.questionText).trim(),
+        passage: String(q.passage || '').trim(),
         explanation: String(q.explanation || '').trim() || 'No explanation provided.',
       };
 
@@ -197,15 +196,13 @@ async function solveExamWithGemini(text, subject) {
   return cleaned;
 }
 
-// ---------------------------------------------------------------------
-// Study Buddy chat — the floating support/homework-help widget.
-// Separate from solveExamWithGemini above (that one forces structured
-// JSON output for a whole exam; this one is a normal back-and-forth
-// conversation), but shares the same retry-on-503 plumbing.
-// ---------------------------------------------------------------------
+// Study Buddy chat — powers the floating widget. Separate from
+// solveExamWithGemini above (that one returns structured JSON for a whole
+// exam, this one is just back-and-forth conversation) but reuses the same
+// retry logic.
 
 const CHAT_SYSTEM_PROMPT =
-  `You are "Study Buddy," a friendly AI assistant built into an Ethiopian Grade 9-12 online ` +
+  `You are "Study Buddy," a friendly study assistant built into an Ethiopian Grade 9-12 online ` +
   `learning platform called eLEARNING. You have two jobs:\n\n` +
   `1. Answer educational questions clearly, at a level appropriate for a grade 9-12 student — ` +
   `explain concepts (e.g. "what is force" in physics, math problems, biology, chemistry, history, ` +
@@ -214,7 +211,7 @@ const CHAT_SYSTEM_PROMPT =
   `2. Help students navigate and troubleshoot the platform itself. The platform has 4 resource ` +
   `categories per grade: Textbooks, Notes/Handouts, Past Papers (Final/Mid/Quiz exams), and — for ` +
   `Grade 12 only — National Exam past papers (pick subject, then year). If a student says an exam ` +
-  `or paper isn't loading, explain that the AI step that solves it can occasionally fail if Google's ` +
+  `or paper isn't loading, explain that the automatic solving step can occasionally fail if the ` +
   `servers are briefly overloaded, and the fix is just to ask a teacher to re-upload it — it usually ` +
   `works on retry.\n\n` +
   `Keep every response short — a few sentences, or a short step-by-step list for worked problems — ` +
@@ -232,9 +229,7 @@ async function chatWithGemini(history, userMessage) {
   const model = process.env.GEMINI_CHAT_MODEL || process.env.GEMINI_MODEL || 'gemini-3.5-flash';
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-  // Gemini wants alternating user/model turns. Our stored history uses
-  // {role: 'user'|'assistant', content}; map 'assistant' -> 'model' and
-  // cap how far back we look so the request stays small and cheap.
+  // Gemini wants alternating user/model turns
   const contents = (Array.isArray(history) ? history : [])
     .filter((m) => m && typeof m.content === 'string' && (m.role === 'user' || m.role === 'assistant'))
     .slice(-16)
